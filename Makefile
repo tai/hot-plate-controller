@@ -4,8 +4,12 @@ TC = /opt/microchip/xc16/v1.35
 
 CPU = 30F2010
 
+# NOTE:
 # FCY = FOSC / 4 (FRM 7.2, Equation 7-1) = 8MHz@FRC / 4 = 2MHz
-FCY = 2000000
+#
+# However, FRC clock is not really stable at 8MHz, so need manual fixup to
+# make UART baudrate equation, etc to work.
+FCY = 1900000
 
 CC = $(TC)/bin/xc16-gcc -mcpu=$(CPU)
 LD = $(CC)
