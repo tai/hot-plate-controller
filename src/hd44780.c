@@ -19,27 +19,20 @@
 
 /* Bus controls */
 #if 1
-#include <avr/io.h>				/* Hardware specific include file */
-#define	IF_BUS		8			/* Bus width (4 or 8) */
-#define DELAY_US(n)	delay_us(n)	/* Delay d microseconds */
-#define	IF_INIT()				/* Initialize control port */
-#define	IF_DLY60()				/* Delay >=60ns (can be blanked for most uC) */
-#define	IF_DLY450()	{}			/* Delay >=450ns@3V, >=250ns@5V */
-#define E1_HIGH()	PORTB|=0x80	/* Set E/E1 high */
-#define E1_LOW()	PORTB&=0x7F	/* Set E/E1 low */
-#define E2_HIGH()	PORTB|=0x01	/* Set E2 high (dual controller only) */
-#define E2_LOW()	PORTB&=0xFE	/* Set E2 low (dual controller only) */
-#define	RS_HIGH()	PORTB|=0x40	/* Set RS high */
-#define	RS_LOW()	PORTB&=0xBF	/* Set RS low */
-#define	OUT_DATA(d)	PORTD=d		/* Output a byte d on the bus (higher 4 bits of d in 4-bit mode) */
-
-static
-void delay_us (unsigned int n)	/* An example of delay n microsecond routine (for Atmel AVR/8MHz) */
-{
-	do {	/* 8 clocks per loop (Atmel AVR) */
-		PINB; PINB; PINB; PINB;
-	} while (--n);
-}
+#include <xc.h>				/* Hardware specific include file */
+#include <libpic30.h>
+#define	IF_BUS		4			/* Bus width (4 or 8) */
+#define DELAY_US(n)	__delay_us(n)	/* Delay d microseconds */
+#define	IF_INIT()	TRISE &= 0b11000000 /* Initialize control port */
+#define	IF_DLY60()	__delay32(1)	/* Delay >=60ns (can be blanked for most uC) */
+#define	IF_DLY450()	__delay32(5)	/* Delay >=450ns@3V, >=250ns@5V */
+#define E1_HIGH()	LATEbits.LATE4 = 1	/* Set E/E1 high */
+#define E1_LOW()	LATEbits.LATE4 = 0	/* Set E/E1 low */
+#define E2_HIGH()		/* Set E2 high (dual controller only) */
+#define E2_LOW()		/* Set E2 low (dual controller only) */
+#define	RS_HIGH()	LATEbits.LATE5 = 1 /* Set RS high */
+#define	RS_LOW()	LATEbits.LATE5 = 0 /* Set RS low */
+#define	OUT_DATA(d)	LATE = (LATE & 0xF0) | (d>>4)	/* Output a byte d on the bus (higher 4 bits of d in 4-bit mode) */
 
 #else
 #include <device.h>				/* Device specific include file */

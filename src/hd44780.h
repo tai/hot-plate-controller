@@ -10,7 +10,7 @@
 /*--------------------------------------------------*/
 
 #define _LCD_ROWS	2		/* Number of Rows (1,2 or 4) */
-#define _LCD_COLS	40		/* Number of Columns (8..40) */
+#define _LCD_COLS	16		/* Number of Columns (8..40) */
 
 #define _USE_CURSOR	0		/* 1:Enable lcd_cursor function */
 #define _USE_CGRAM	0		/* 1:Enable lcd_setcg function */
