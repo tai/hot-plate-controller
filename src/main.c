@@ -14,6 +14,7 @@
 // FOSC - Oscillator Configurations (DS 19.2)
 #pragma config FOS = FRC
 #pragma config FCKSMEN = CSW_FSCM_OFF // clock switching disable, monitoring disabled
+#pragma config FPR = ERCIO // Use OSC2/RC15 as GPIO (clock is set by FOS=FRC)
 
 // FWDT
 #pragma config WDT = WDT_OFF          // watchdog disabled
@@ -96,22 +97,68 @@ spi_send(uint16_t val) {
   return SPI1BUF;
 }
 
+void
+ssr_init(void) {
+  TRISCbits.TRISC15 = 0;
+}
+
+void
+ssr_control(void) {
+  LATCbits.LATC15 ^= 1;
+}
+
+void
+timer_init(void) {
+  // Make timer1 overflow ~30times/s
+  T1CON = 0b1000000000000000; /*
+            ^TON:1=start timer
+             ^-
+              ^TSIDL:0=continue in idle mode
+               ^^^^^^-
+                     ^TGATE:0=disable gated time accumulation
+                      ^^TCKPS:00=1/1 prescale
+                        ^-
+                         ^TSYNC:ignored for internal clock
+                          ^TCS:0=internal clock (FOSC/4)
+                           ^-
+  */
+
+  IEC0bits.T1IE = 1;
+}
+
+void __attribute__((interrupt, no_auto_psv))
+_T1Interrupt(void) {
+  static int nr;
+
+  // Run this about once a second (see T1CON)
+  if (nr++ == 30) {
+    nr = 0;
+    led_blink();
+  }
+
+  IFS0bits.T1IF = 0;
+}
+
+
 int
 main(void) {
   static int c = 'a';
 
   led_init();
-  uart_init();
 
+  uart_init();
   uart_puts("reset\r\n");
+
+  timer_init();
+
   lcd_init();
   spi_init();
 
-  spi_send(0);
+  ssr_init();
 
   for (;;) {
     __delay_ms(500);
-    led_blink();
+    //led_blink();
 
     if (c > 'z') c = 'a';
     lcd_locate(0, 0);
@@ -123,6 +170,8 @@ main(void) {
     uint8_t max6675_status = ret & 0x7;
     int16_t max6675_result = ret >> 6;
     printf("s=%d, t=%d\r\n", max6675_status, max6675_result);
+
+    ssr_control();
   }
 
   return 0;
