@@ -11,6 +11,8 @@
 
 #include "hd44780.h"
 
+#include "pt.h"
+
 // FOSC - Oscillator Configurations (DS 19.2)
 #pragma config FOS = FRC
 #pragma config FCKSMEN = CSW_FSCM_OFF // clock switching disable, monitoring disabled
@@ -28,6 +30,14 @@
 #pragma config ICS = ICS_PGD
 
 #define BAUDRATE 9600
+
+// Global context to pass around
+volatile struct ctx_t {
+  bool is_idle;
+  bool is_clicked;
+  uint16_t tc_curr;
+  uint16_t tc_goal;
+} ctx;
 
 static inline void
 uart_init(void) {
@@ -108,8 +118,12 @@ ssr_control(void) {
 }
 
 void
-timer_init(void) {
-  // Make timer1 overflow ~30times/s
+tick_init(void) {
+  //
+  // Create "systick" timer that triggers every 1ms.
+  // 8MHz / 4 / 1KHz = 2000
+  //
+  PR1 = 2000;
   T1CON = 0b1000000000000000; /*
             ^TON:1=start timer
              ^-
@@ -128,37 +142,22 @@ timer_init(void) {
 
 void __attribute__((interrupt, no_auto_psv))
 _T1Interrupt(void) {
-  static int nr;
-
-  // Run this about once a second (see T1CON)
-  if (nr++ == 30) {
-    nr = 0;
-    led_blink();
-  }
-
+  // do nothing - just wake up
+  ctx.is_idle = 0;
   IFS0bits.T1IF = 0;
 }
 
-
-int
-main(void) {
+PT_THREAD(run_task(struct pt *pt)) {
+  static int nr;
   static int c = 'a';
 
-  led_init();
-
-  uart_init();
-  uart_puts("reset\r\n");
-
-  timer_init();
-
-  lcd_init();
-  spi_init();
-
-  ssr_init();
+  PT_BEGIN(pt);
 
   for (;;) {
-    __delay_ms(500);
-    //led_blink();
+    PT_WAIT_UNTIL(pt, nr++ == 500);
+    nr = 0;
+
+    led_blink();
 
     if (c > 'z') c = 'a';
     lcd_locate(0, 0);
@@ -172,6 +171,34 @@ main(void) {
     printf("s=%d, t=%d\r\n", max6675_status, max6675_result);
 
     ssr_control();
+  }
+  PT_END(pt);
+}
+
+int
+main(void) {
+  led_init();
+
+  uart_init();
+  uart_puts("reset\r\n");
+
+  tick_init();
+
+  lcd_init();
+  spi_init();
+
+  ssr_init();
+
+  struct pt pt1, pt2, pt3, pt4;
+
+  for (;;) {
+    ctx.is_idle = 1;
+    Idle();
+
+    // run systick tasks only when kicked from systick timer
+    if (! ctx.is_idle) {
+      run_task(&pt1);
+    }
   }
 
   return 0;
