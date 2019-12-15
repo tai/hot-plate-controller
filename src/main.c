@@ -33,6 +33,7 @@
 
 // Global context to pass around
 volatile struct ctx_t {
+  uint32_t tick;
   bool is_idle;
   bool is_clicked;
   uint16_t tc_curr;
@@ -143,8 +144,22 @@ tick_init(void) {
 void __attribute__((interrupt, no_auto_psv))
 _T1Interrupt(void) {
   // do nothing - just wake up
+  ctx.tick++;
   ctx.is_idle = 0;
   IFS0bits.T1IF = 0;
+}
+
+PT_THREAD(blink_task(struct pt *pt)) {
+  static uint32_t next_timing;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    led_blink();
+    next_timing += 1000;
+  }
+  PT_END(pt);
 }
 
 PT_THREAD(run_task(struct pt *pt)) {
@@ -156,8 +171,6 @@ PT_THREAD(run_task(struct pt *pt)) {
   for (;;) {
     PT_WAIT_UNTIL(pt, nr++ == 500);
     nr = 0;
-
-    led_blink();
 
     if (c > 'z') c = 'a';
     lcd_locate(0, 0);
@@ -194,6 +207,8 @@ main(void) {
   for (;;) {
     ctx.is_idle = 1;
     Idle();
+
+    blink_task(&pt2);
 
     // run systick tasks only when kicked from systick timer
     if (! ctx.is_idle) {
