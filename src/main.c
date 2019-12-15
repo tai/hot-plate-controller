@@ -33,11 +33,10 @@
 
 // Global context to pass around
 volatile struct ctx_t {
-  uint32_t tick;
-  bool is_idle;
-  bool is_clicked;
-  uint16_t tc_curr;
-  uint16_t tc_goal;
+  uint32_t tick; // systick
+  int tc_curr; // current temperature
+  int tc_goal; // temperature to aim for
+  int tc_disp; // displayed temperature for user control
 } ctx;
 
 static inline void
@@ -62,6 +61,15 @@ uart_puts(const char *s) {
   while (*s) {
     uart_putc((uint8_t)*s++);
   }
+}
+
+int
+write(int handle, uint8_t *buf, size_t len) {
+  int i;
+  for (i = 0; i < len; i++) {
+    lcd_putc(buf[i]);
+  }
+  return len;
 }
 
 static inline void
@@ -109,6 +117,13 @@ spi_send(uint16_t val) {
 }
 
 void
+ui_init(void) {
+  ADPCFG = 0xFF;     // all ADC/GPIO mux pins in GPIO mode (FRM 17, Register 17-5)
+  TRISB  = 0b111000; // RB[012]: output, RB[345]: input
+  LATB   = 0b000000; // RB[012]: X,      RB[345]: 0
+}
+
+void
 ssr_init(void) {
   TRISCbits.TRISC15 = 0;
 }
@@ -145,7 +160,6 @@ void __attribute__((interrupt, no_auto_psv))
 _T1Interrupt(void) {
   // do nothing - just wake up
   ctx.tick++;
-  ctx.is_idle = 0;
   IFS0bits.T1IF = 0;
 }
 
@@ -156,35 +170,146 @@ PT_THREAD(blink_task(struct pt *pt)) {
 
   for (;;) {
     PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    next_timing = ctx.tick + 1000;
+
     led_blink();
-    next_timing += 1000;
   }
   PT_END(pt);
 }
 
 PT_THREAD(run_task(struct pt *pt)) {
-  static int nr;
-  static int c = 'a';
+  static uint32_t next_timing;
 
   PT_BEGIN(pt);
 
   for (;;) {
-    PT_WAIT_UNTIL(pt, nr++ == 500);
-    nr = 0;
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    next_timing = ctx.tick + 500;
 
-    if (c > 'z') c = 'a';
     lcd_locate(0, 0);
-    lcd_putc(c);
-    uart_putc(c++);
-
-    // See MAX6675 DS
-    uint16_t ret = spi_send(0);
-    uint8_t max6675_status = ret & 0x7;
-    int16_t max6675_result = ret >> 6;
-    printf("s=%d, t=%d\r\n", max6675_status, max6675_result);
+    printf("%d -> %d %c  ",
+           ctx.tc_curr, ctx.tc_disp, ctx.tc_disp == ctx.tc_goal ? ' ' : '?');
 
     ssr_control();
   }
+  PT_END(pt);
+}
+
+typedef enum { MS_INIT, MS_WAIT } measure_state_t;
+
+PT_THREAD(measure_task(struct pt *pt)) {
+  static measure_state_t state = MS_INIT;
+  static uint32_t next_timing;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+
+    switch (state) {
+    case MS_INIT:
+      LATDbits.LATD1 = 0;
+      __delay_us(1);
+      SPI1BUF = 0; // dummy write to drive SPI clock
+      state = MS_WAIT;
+      next_timing = ctx.tick + 6; // data should be clocked in after 6ms
+      break;
+    case MS_WAIT:
+      LATDbits.LATD1 = 1;
+
+      // extract temperature in 10bit resolution
+      // See MAX6675 DS
+      ctx.tc_curr = SPI1BUF >> 6;
+
+      state = MS_INIT;
+      next_timing = ctx.tick + 1000; // redo after 1000ms
+      break;
+    }
+  }
+  PT_END(pt);
+}
+
+PT_THREAD(ui_task(struct pt *pt)) {
+  static uint32_t next_timing;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    next_timing = ctx.tick + 300;
+
+    LATBbits.LATB0 ^= 1;
+  }
+
+  PT_END(pt);
+}
+
+typedef enum { BS_INIT, BS_CHECK_PRESS, BS_CHECK_RELEASE } button_state_t;
+
+#define ASSERTED 0
+
+PT_THREAD(button_task(struct pt *pt)) {
+  static uint32_t next_timing;
+  static button_state_t state;
+  uint8_t delay = 1;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+
+    switch (state) {
+    case BS_INIT:
+      if (PORTBbits.RB3 == ASSERTED) {
+        state = BS_CHECK_PRESS;
+        delay = 30;
+      }
+      break;
+    case BS_CHECK_PRESS:
+      if (PORTBbits.RB3 == ASSERTED) {
+        // update goal temperature
+        ctx.tc_goal = ctx.tc_disp;
+        state = BS_CHECK_RELEASE;
+      }
+      else {
+        state = BS_INIT;
+      }
+      break;
+    case BS_CHECK_RELEASE:
+      if (PORTBbits.RB3 != ASSERTED) {
+        state = BS_INIT;
+      }
+      break;
+    }
+
+    next_timing = ctx.tick + delay;
+  }
+
+  PT_END(pt);
+}
+
+PT_THREAD(rotenc_task(struct pt *pt)) {
+  static uint32_t next_timing;
+  static const int dir[] = { 0,1,-1,0,-1,0,0,1,1,0,0,-1,0,-1,1,0 };
+  static uint8_t ab;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    next_timing = ctx.tick + 1;
+
+    ab = (ab << 2) + ((PORTB >> 4) & 0b11);
+
+    int n = dir[ab & 0xF];
+    if (n) {
+      ctx.tc_disp += n;
+      if (ctx.tc_disp < 0) {
+        ctx.tc_disp = 0;
+      }
+    }
+  }
+
   PT_END(pt);
 }
 
@@ -197,23 +322,24 @@ main(void) {
 
   tick_init();
 
+  ui_init();
   lcd_init();
   spi_init();
 
   ssr_init();
 
-  struct pt pt1, pt2, pt3, pt4;
+  struct pt pt1, pt2, pt3, pt4, pt5, pt6;
 
   for (;;) {
-    ctx.is_idle = 1;
     Idle();
 
-    blink_task(&pt2);
+    rotenc_task(&pt6);
+    button_task(&pt5);
+    ui_task(&pt4);
 
-    // run systick tasks only when kicked from systick timer
-    if (! ctx.is_idle) {
-      run_task(&pt1);
-    }
+    measure_task(&pt3);
+    blink_task(&pt2);
+    run_task(&pt1);
   }
 
   return 0;
