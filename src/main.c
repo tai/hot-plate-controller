@@ -1,3 +1,12 @@
+/**********************************************************************
+ * Hot Plate Controller
+ * 
+ * This code controls external SSR based on temperature sensor data.
+ * User can change/set temperature using a rotary encoder and a button.
+ * LCD shows both current and target temperature.
+ * LEDs indicates aliveness and when SSR is being turned on.
+ * 
+ **********************************************************************/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +21,10 @@
 #include "hd44780.h"
 
 #include "pt.h"
+
+/**********************************************************************
+ * config bits
+ **********************************************************************/
 
 // FOSC - Oscillator Configurations (DS 19.2)
 #pragma config FOS = FRC
@@ -29,15 +42,60 @@
 // FICD
 #pragma config ICS = ICS_PGD
 
+/**********************************************************************
+ * PINOUT
+ **********************************************************************/
+
+// for blinking LED
+#define LED_IO D0
+
+// for SSR control
+#define SSR_IO C15
+
+// for SPI IO
+#define SPI_MISO F2
+#define SPI_MOSI F3
+#define SPI_SCK E8
+#define SPI_CS D1
+
+// for LCD output
+#define LCD_PORT E
+#define LCD_B4 E0
+#define LCD_B5 E1
+#define LCD_B6 E2
+#define LCD_B7 E3
+#define LCD_EN E4
+#define LCD_RS E5
+
+// for rotary encoder + button input
+#define ROTENC_BUTTON B3
+#define ROTENC_A B4
+#define ROTENC_B B5
+
+// for alternate UART
+#define UART_TX C13
+#define UART_RX C14
+
+/**********************************************************************
+ * Global macros and variables
+ **********************************************************************/
+
 #define BAUDRATE 9600
+#define ASSERTED 0
 
 // Global context to pass around
 volatile struct ctx_t {
   uint32_t tick; // systick
+
+  // temperature management
   int tc_curr; // current temperature
   int tc_goal; // temperature to aim for
   int tc_disp; // displayed temperature for user control
 } ctx;
+
+/**********************************************************************
+ * UART
+ **********************************************************************/
 
 static inline void
 uart_init(void) {
@@ -63,26 +121,132 @@ uart_puts(const char *s) {
   }
 }
 
+/**********************************************************************
+ * STDIO for libpic30.
+ * See DS50001456J, 16-Bit Language Tools Libraries Reference Manual.
+ * 
+ * Predefined handles are: 0=stdin, 1=stdout, 2=stderr.
+ * Here, I tried to enhance with LCD output, but open/fopen overwrite
+ * does not seem to be working. So I simply overwrote stderr to be LCD.
+ **********************************************************************/
+
+//FILE *lcdout;
+#define lcdout stderr
+
+enum {
+  handle_stdin, 
+  handle_stdout, 
+  handle_stderr, 
+  handle_lcdout,
+};
+
+#if 0
+int
+open(const char *name, int access, int mode) {
+  uart_puts(name);
+  switch (name[0]) {
+  case 'i': return handle_stdin;
+  case 'o': return handle_stdout;
+  case 'e': return handle_stderr;
+  case 'L': return handle_lcdout;
+  default:  return handle_stderr;
+  }
+}
+#endif
+
 int
 write(int handle, uint8_t *buf, size_t len) {
   int i;
-  for (i = 0; i < len; i++) {
-    lcd_putc(buf[i]);
+
+  switch (handle) {
+  case handle_stderr:
+    for (i = 0; i < len; i++) {
+      lcd_putc(buf[i]);
+    }
+    break;
+  default:
+    for (i = 0; i < len; i++) {
+      uart_putc(buf[i]);
+    }
   }
+
   return len;
 }
+
+/**********************************************************************
+ * LED blink task, just to show the chip is alive.
+ **********************************************************************/
 
 static inline void
 led_init(void) {
   TRISDbits.TRISD0 = 0;
 }
 
-static inline void
-led_blink(void) {
-  LATDbits.LATD0 ^= 1;
+PT_THREAD(led_task(struct pt *pt)) {
+  static uint32_t next_timing;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    next_timing = ctx.tick + 1000;
+
+    LATDbits.LATD0 ^= 1;
+  }
+  PT_END(pt);
 }
 
-static void
+/**********************************************************************
+ * LCD task - show current temperature and user configuration
+ * 
+ * A port of ChaN's HD44780 control code is used for actual control.
+ **********************************************************************/
+
+PT_THREAD(lcd_task(struct pt *pt)) {
+  static uint32_t next_timing;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    next_timing = ctx.tick + 500;
+
+    lcd_locate(0, 0);
+    fprintf(lcdout, "%d -> %d %c  \r\n",
+            ctx.tc_curr, ctx.tc_disp, ctx.tc_disp == ctx.tc_goal ? ' ' : '?');
+  }
+  PT_END(pt);
+}
+
+/**********************************************************************
+ * SSR control task
+ **********************************************************************/
+
+static inline void
+control_init(void) {
+  TRISCbits.TRISC15 = 0;
+}
+
+PT_THREAD(control_task(struct pt *pt)) {
+  static uint32_t next_timing;
+
+  PT_BEGIN(pt);
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    next_timing = ctx.tick + 1000;
+
+    if (ctx.tc_goal > ctx.tc_curr) {
+      LATCbits.LATC15 ^= 1;
+    }
+  }
+  PT_END(pt);
+}
+
+/**********************************************************************
+ * SPI IO task
+ **********************************************************************/
+
+static inline void
 spi_init(void) {
   // Use RD1 as nSS
   TRISDbits.TRISD1 = 0;
@@ -106,34 +270,139 @@ spi_init(void) {
   SPI1STATbits.SPIEN = 1;  // enable SPI
 }
 
-uint16_t
-spi_send(uint16_t val) {
-  LATDbits.LATD1 = 0;
-  __delay_us(1);
-  SPI1BUF = val;
-  __delay_ms(6);
-  LATDbits.LATD1 = 1;
-  return SPI1BUF;
+PT_THREAD(spi_sensor_task(struct pt *pt)) {
+  typedef enum { MS_INIT, MS_WAIT } measure_state_t;
+
+  static measure_state_t state = MS_INIT;
+  static uint32_t next_timing;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+
+    switch (state) {
+    case MS_INIT:
+      LATDbits.LATD1 = 0;
+      __delay_us(1);
+      SPI1BUF = 0; // dummy write to drive SPI clock
+      state = MS_WAIT;
+      next_timing = ctx.tick + 6; // data should be clocked in after 6ms
+      break;
+    case MS_WAIT:
+    default:
+      LATDbits.LATD1 = 1;
+
+      // extract temperature in 10bit resolution
+      // See MAX6675 DS
+      ctx.tc_curr = SPI1BUF >> 6;
+
+      state = MS_INIT;
+      next_timing = ctx.tick + 1000; // rescan after 1000ms
+    }
+  }
+  PT_END(pt);
 }
 
-void
+/**********************************************************************
+ * UI task - handle user inputs from a rotary encoder and a button
+ **********************************************************************/
+
+static inline void
 ui_init(void) {
   ADPCFG = 0xFF;     // all ADC/GPIO mux pins in GPIO mode (FRM 17, Register 17-5)
   TRISB  = 0b111000; // RB[012]: output, RB[345]: input
   LATB   = 0b000000; // RB[012]: X,      RB[345]: 0
 }
 
-void
-ssr_init(void) {
-  TRISCbits.TRISC15 = 0;
+PT_THREAD(ui_button_task(struct pt *pt)) {
+  typedef enum { BS_INIT, BS_CHECK_PRESS, BS_CHECK_RELEASE } button_state_t;
+
+  static uint32_t next_timing;
+  static button_state_t state;
+  uint8_t delay = 1;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+
+    switch (state) {
+    case BS_INIT:
+      if (PORTBbits.RB3 == ASSERTED) {
+        state = BS_CHECK_PRESS;
+        delay = 30;
+      }
+      break;
+    case BS_CHECK_PRESS:
+      if (PORTBbits.RB3 == ASSERTED) {
+        // update goal temperature
+        ctx.tc_goal = ctx.tc_disp;
+        state = BS_CHECK_RELEASE;
+      }
+      else {
+        state = BS_INIT;
+      }
+      break;
+    case BS_CHECK_RELEASE:
+    default:
+      if (PORTBbits.RB3 != ASSERTED) {
+        state = BS_INIT;
+      }
+    }
+
+    next_timing = ctx.tick + delay;
+  }
+
+  PT_END(pt);
 }
 
-void
-ssr_control(void) {
-  LATCbits.LATC15 ^= 1;
+PT_THREAD(ui_rotenc_task(struct pt *pt)) {
+  static uint32_t next_timing;
+  static const int dir[] = { 0,1,-1,0,-1,0,0,1,1,0,0,-1,0,-1,1,0 };
+  static uint8_t ab;
+  static int8_t raw, fix;
+
+  PT_BEGIN(pt);
+
+  for (;;) {
+    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
+    next_timing = ctx.tick + 1;
+
+    ab = (ab << 2) + ((PORTB >> 4) & 0b11);
+    raw -= dir[ab & 0xF]; // add/sub op depends on AB or BA wiring
+
+    // Fixup to update temperature by 1 for each encoder click.
+    // A divide does the trick as current encoder generates pulse
+    // by 4 count for each click.
+    if (raw >= 4) {
+      fix = raw >> 2;
+      if (fix == 0) fix = 1;
+      raw = 0;
+    }
+    else if (raw <= -4) {
+      fix = -(-raw >> 2);
+      if (fix == 0) fix = -1;
+      raw = 0;
+    }
+
+    if (fix != 0) {
+      ctx.tc_disp += fix;
+      fix = 0;
+      if (ctx.tc_disp < 0) {
+        ctx.tc_disp = 0;
+      }
+    }
+  }
+
+  PT_END(pt);
 }
 
-void
+/**********************************************************************
+ * systick - 1ms tick timer for driving tasks
+ **********************************************************************/
+
+static inline void
 tick_init(void) {
   //
   // Create "systick" timer that triggers every 1ms.
@@ -163,155 +432,9 @@ _T1Interrupt(void) {
   IFS0bits.T1IF = 0;
 }
 
-PT_THREAD(blink_task(struct pt *pt)) {
-  static uint32_t next_timing;
-
-  PT_BEGIN(pt);
-
-  for (;;) {
-    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
-    next_timing = ctx.tick + 1000;
-
-    led_blink();
-  }
-  PT_END(pt);
-}
-
-PT_THREAD(run_task(struct pt *pt)) {
-  static uint32_t next_timing;
-
-  PT_BEGIN(pt);
-
-  for (;;) {
-    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
-    next_timing = ctx.tick + 500;
-
-    lcd_locate(0, 0);
-    printf("%d -> %d %c  ",
-           ctx.tc_curr, ctx.tc_disp, ctx.tc_disp == ctx.tc_goal ? ' ' : '?');
-
-    ssr_control();
-  }
-  PT_END(pt);
-}
-
-typedef enum { MS_INIT, MS_WAIT } measure_state_t;
-
-PT_THREAD(measure_task(struct pt *pt)) {
-  static measure_state_t state = MS_INIT;
-  static uint32_t next_timing;
-
-  PT_BEGIN(pt);
-
-  for (;;) {
-    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
-
-    switch (state) {
-    case MS_INIT:
-      LATDbits.LATD1 = 0;
-      __delay_us(1);
-      SPI1BUF = 0; // dummy write to drive SPI clock
-      state = MS_WAIT;
-      next_timing = ctx.tick + 6; // data should be clocked in after 6ms
-      break;
-    case MS_WAIT:
-      LATDbits.LATD1 = 1;
-
-      // extract temperature in 10bit resolution
-      // See MAX6675 DS
-      ctx.tc_curr = SPI1BUF >> 6;
-
-      state = MS_INIT;
-      next_timing = ctx.tick + 1000; // redo after 1000ms
-      break;
-    }
-  }
-  PT_END(pt);
-}
-
-PT_THREAD(ui_task(struct pt *pt)) {
-  static uint32_t next_timing;
-
-  PT_BEGIN(pt);
-
-  for (;;) {
-    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
-    next_timing = ctx.tick + 300;
-
-    LATBbits.LATB0 ^= 1;
-  }
-
-  PT_END(pt);
-}
-
-typedef enum { BS_INIT, BS_CHECK_PRESS, BS_CHECK_RELEASE } button_state_t;
-
-#define ASSERTED 0
-
-PT_THREAD(button_task(struct pt *pt)) {
-  static uint32_t next_timing;
-  static button_state_t state;
-  uint8_t delay = 1;
-
-  PT_BEGIN(pt);
-
-  for (;;) {
-    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
-
-    switch (state) {
-    case BS_INIT:
-      if (PORTBbits.RB3 == ASSERTED) {
-        state = BS_CHECK_PRESS;
-        delay = 30;
-      }
-      break;
-    case BS_CHECK_PRESS:
-      if (PORTBbits.RB3 == ASSERTED) {
-        // update goal temperature
-        ctx.tc_goal = ctx.tc_disp;
-        state = BS_CHECK_RELEASE;
-      }
-      else {
-        state = BS_INIT;
-      }
-      break;
-    case BS_CHECK_RELEASE:
-      if (PORTBbits.RB3 != ASSERTED) {
-        state = BS_INIT;
-      }
-      break;
-    }
-
-    next_timing = ctx.tick + delay;
-  }
-
-  PT_END(pt);
-}
-
-PT_THREAD(rotenc_task(struct pt *pt)) {
-  static uint32_t next_timing;
-  static const int dir[] = { 0,1,-1,0,-1,0,0,1,1,0,0,-1,0,-1,1,0 };
-  static uint8_t ab;
-
-  PT_BEGIN(pt);
-
-  for (;;) {
-    PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
-    next_timing = ctx.tick + 1;
-
-    ab = (ab << 2) + ((PORTB >> 4) & 0b11);
-
-    int n = dir[ab & 0xF];
-    if (n) {
-      ctx.tc_disp += n;
-      if (ctx.tc_disp < 0) {
-        ctx.tc_disp = 0;
-      }
-    }
-  }
-
-  PT_END(pt);
-}
+/**********************************************************************
+ * app main
+ **********************************************************************/
 
 int
 main(void) {
@@ -326,20 +449,22 @@ main(void) {
   lcd_init();
   spi_init();
 
-  ssr_init();
+  control_init();
 
-  struct pt pt1, pt2, pt3, pt4, pt5, pt6;
+  struct pt pt1, pt2, pt3, pt4, pt5, pt6, pt7;
 
   for (;;) {
     Idle();
 
-    rotenc_task(&pt6);
-    button_task(&pt5);
-    ui_task(&pt4);
+    ui_rotenc_task(&pt6);
+    ui_button_task(&pt5);
 
-    measure_task(&pt3);
-    blink_task(&pt2);
-    run_task(&pt1);
+    control_task(&pt7);
+
+    spi_sensor_task(&pt3);
+
+    led_task(&pt2);
+    lcd_task(&pt1);
   }
 
   return 0;
