@@ -220,6 +220,30 @@ PT_THREAD(lcd_task(struct pt *pt)) {
 
 /**********************************************************************
  * SSR control task
+ *
+ * Controlling AC power with SSR is tricky because SSR only
+ * turns on/off at zero-cross point, not when CPU controlled the port.
+ * 
+ * Also, using fast-paced PWM (one used for DC power control) does
+ * not work, because AC power is a sine wave and not evenly distributed
+ * over time. If SSR was turned on during near-zero point, it won't
+ * provide power like you expect with DC.
+ * 
+ * Here, slower-paced PWM is used to control AC power.
+ * SSR is controlled with 16bit value, where each bit represents
+ * power state of each 83ms period. As AC is 50/60Hz, 83ms contains
+ * at least 3 complete cycles, avoiding problem with the fast PWM.
+ * 
+ * This 16bit value is handled as follows:
+ * 
+ * 11111111 11111111 all-periods turned on (full power)
+ * 11111111 11111110 15 periods turned on
+ * 11111111 11111100 14 periods turned on
+ * 11111111 11111000 ...
+ * 00000000 00000000 all-periods turned off (no power)
+ * 
+ * So 16-levels of power output can be managed.
+ * 
  **********************************************************************/
 
 static inline void
@@ -229,15 +253,19 @@ control_init(void) {
 
 PT_THREAD(control_task(struct pt *pt)) {
   static uint32_t next_timing;
+  static uint16_t power_bits;
+  static uint8_t i;
 
   PT_BEGIN(pt);
   for (;;) {
     PT_WAIT_UNTIL(pt, ctx.tick >= next_timing);
-    next_timing = ctx.tick + 1000;
+    next_timing = ctx.tick + 83;
 
-    if (ctx.tc_goal > ctx.tc_curr) {
-      LATCbits.LATC15 ^= 1;
-    }
+    // control SSR
+    LATCbits.LATC15 = (power_bits >> (i++ & 0xF)) & 1;
+
+    // update power schedule - 2 levels for now
+    power_bits = (ctx.tc_goal > ctx.tc_curr) ? 0xFFFF : 0x0000;
   }
   PT_END(pt);
 }
