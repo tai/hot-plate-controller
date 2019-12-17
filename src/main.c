@@ -83,9 +83,11 @@
 #define BAUDRATE 9600
 #define ASSERTED 0
 
+typedef uint32_t tick_t;
+
 // Global context to pass around
 volatile struct ctx_t {
-  uint32_t tick; // systick
+  tick_t tick; // systick
 
   // temperature management
   int tc_curr; // current temperature
@@ -183,7 +185,7 @@ led_init(void) {
 }
 
 PT_THREAD(led_task(struct pt *pt)) {
-  static uint32_t next_timing;
+  static tick_t next_timing;
 
   PT_BEGIN(pt);
 
@@ -203,7 +205,7 @@ PT_THREAD(led_task(struct pt *pt)) {
  **********************************************************************/
 
 PT_THREAD(lcd_task(struct pt *pt)) {
-  static uint32_t next_timing;
+  static tick_t next_timing;
 
   PT_BEGIN(pt);
 
@@ -231,8 +233,9 @@ PT_THREAD(lcd_task(struct pt *pt)) {
  * 
  * Here, slower-paced PWM is used to control AC power.
  * SSR is controlled with 16bit value, where each bit represents
- * power state of each 83ms period. As AC is 50/60Hz, 83ms contains
- * at least 3 complete cycles, avoiding problem with the fast PWM.
+ * power status of each 83ms period. As AC is 50/60Hz, 83ms would
+ * contain at least 3 complete cycles, avoiding problem with the
+ * fast-paced PWM.
  * 
  * This 16bit value is handled as follows:
  * 
@@ -252,7 +255,7 @@ control_init(void) {
 }
 
 PT_THREAD(control_task(struct pt *pt)) {
-  static uint32_t next_timing;
+  static tick_t next_timing;
   static uint16_t power_bits;
   static uint8_t i;
 
@@ -264,7 +267,7 @@ PT_THREAD(control_task(struct pt *pt)) {
     // control SSR
     LATCbits.LATC15 = (power_bits >> (i++ & 0xF)) & 1;
 
-    // update power schedule - 2 levels for now
+    // update power schedule
     power_bits = (ctx.tc_goal > ctx.tc_curr) ? 0xFFFF : 0x0000;
   }
   PT_END(pt);
